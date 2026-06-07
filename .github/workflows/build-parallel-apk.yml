@@ -40,62 +40,75 @@ jobs:
           restore-keys: gradle-
 
       - name: Apply Parallel Download Patch
+        env:
+          PARALLEL_PAGES: ${{ github.event.inputs.parallel_pages }}
+          PARALLEL_CHAPTERS: ${{ github.event.inputs.parallel_chapters }}
         run: |
-          PARALLEL_PAGES=${{ github.event.inputs.parallel_pages }}
-          PARALLEL_CHAPTERS=${{ github.event.inputs.parallel_chapters }}
-
           DOWNLOADER=$(find . -name "Downloader.kt" | head -1)
-          echo "Found: $DOWNLOADER"
-          cp "$DOWNLOADER" "${DOWNLOADER}.bak"
-
-          if ! grep -q "PARALLEL_PAGES" "$DOWNLOADER"; then
-            sed -i "/companion object {/a\\        private const val PARALLEL_PAGES = $PARALLEL_PAGES\n        private const val PARALLEL_CHAPTERS = $PARALLEL_CHAPTERS" "$DOWNLOADER"
-          fi
+          echo "Patching: $DOWNLOADER"
 
           PATCH_DIR=$(dirname "$DOWNLOADER")
-          cat > "$PATCH_DIR/ParallelDownloadExtensions.kt" << 'KOTLIN'
-package eu.kanade.tachiyomi.data.download
 
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
-import kotlinx.coroutines.withContext
+          python3 - <<PYEOF
+          import os
 
-suspend fun <T> List<T>.parallelForEach(
-    concurrency: Int = 5,
-    block: suspend (T) -> Unit
-) {
-    val semaphore = Semaphore(concurrency)
-    withContext(Dispatchers.IO) {
-        map { item ->
-            async {
-                semaphore.withPermit { block(item) }
-            }
-        }.awaitAll()
-    }
-}
+          patch_dir = os.environ.get('PATCH_DIR', '$PATCH_DIR')
+          pages = os.environ.get('PARALLEL_PAGES', '5')
+          chapters = os.environ.get('PARALLEL_CHAPTERS', '2')
 
-suspend fun <T> withRetry(
-    maxRetry: Int = 3,
-    block: suspend () -> T
-): T {
-    var lastError: Exception? = null
-    repeat(maxRetry) { attempt ->
-        try {
-            return block()
-        } catch (e: Exception) {
-            lastError = e
-            if (attempt < maxRetry - 1) delay(1000L * (attempt + 1))
-        }
-    }
-    throw lastError ?: Exception("Gagal setelah $maxRetry percobaan")
-}
-KOTLIN
+          kotlin_code = """package eu.kanade.tachiyomi.data.download
 
-          echo "Patch applied! PARALLEL_PAGES=$PARALLEL_PAGES PARALLEL_CHAPTERS=$PARALLEL_CHAPTERS"
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.async
+          import kotlinx.coroutines.awaitAll
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.sync.Semaphore
+          import kotlinx.coroutines.sync.withPermit
+          import kotlinx.coroutines.withContext
+
+          object ParallelDownloadConfig {
+              const val PARALLEL_PAGES = """ + pages + """
+              const val PARALLEL_CHAPTERS = """ + chapters + """
+          }
+
+          suspend fun <T> List<T>.parallelForEach(
+              concurrency: Int = ParallelDownloadConfig.PARALLEL_PAGES,
+              block: suspend (T) -> Unit
+          ) {
+              val semaphore = Semaphore(concurrency)
+              withContext(Dispatchers.IO) {
+                  map { item ->
+                      async {
+                          semaphore.withPermit { block(item) }
+                      }
+                  }.awaitAll()
+              }
+          }
+
+          suspend fun <T> withRetry(
+              maxRetry: Int = 3,
+              block: suspend () -> T
+          ): T {
+              var lastError: Exception? = null
+              repeat(maxRetry) { attempt ->
+                  try {
+                      return block()
+                  } catch (e: Exception) {
+                      lastError = e
+                      if (attempt < maxRetry - 1) delay(1000L * (attempt + 1))
+                  }
+              }
+              throw lastError ?: Exception("Failed after $maxRetry retries")
+          }
+          """
+
+          out_path = os.path.join(patch_dir, 'ParallelDownloadExtensions.kt')
+          with open(out_path, 'w') as f:
+              f.write(kotlin_code)
+          print(f"Written: {out_path}")
+          PYEOF
+
+          echo "Patch done! PARALLEL_PAGES=$PARALLEL_PAGES PARALLEL_CHAPTERS=$PARALLEL_CHAPTERS"
 
       - name: Make Gradlew Executable
         run: chmod +x gradlew
@@ -104,21 +117,12 @@ KOTLIN
         run: |
           ./gradlew assembleDebug \
             --no-daemon \
-            --stacktrace \
             -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=512m"
-
-      - name: Rename APK
-        run: |
-          PAGES=${{ github.event.inputs.parallel_pages }}
-          DATE=$(date +%Y%m%d)
-          APK_SRC=$(find . -name "*.apk" -path "*/debug/*" | head -1)
-          APK_DST="mihon-parallel-p${PAGES}-${DATE}.apk"
-          cp "$APK_SRC" "$APK_DST"
-          echo "APK_PATH=$APK_DST" >> $GITHUB_ENV
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: mihon-parallel-download-apk
-          path: ${{ env.APK_PATH }}
+          path: app/build/outputs/apk/debug/*.apk
           retention-days: 7
+          
